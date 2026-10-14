@@ -13,10 +13,19 @@ from PIL import Image, ImageDraw, ImageFont
 from pathlib import Path
 
 # Set LD_LIBRARY_PATH only for PyNVML init, then unset so Qt6 works.
-# (PyNVML needs /usr/lib64; PySide6 QtRenderer fails when
+# (PyNVML needs the driver lib dir; PySide6 QtRenderer fails when
 #  LD_LIBRARY_PATH points there because of Qt_6.11_PRIVATE_API mismatch.)
-CDLL("/usr/lib64/libnvidia-ml.so.1")  # preload the handle
-os.environ["LD_LIBRARY_PATH"] = "/usr/lib64"
+# The driver lib dir is distro-specific: Bazzite/openSUSE use /usr/lib64,
+# Debian/Ubuntu use /usr/lib/x86_64-linux-gnu. Probe the known locations;
+# pynvml falls back to its own dlopen search when none match.
+_NVML_LIB_DIR = None
+for _dir in ("/usr/lib64", "/usr/lib/x86_64-linux-gnu", "/usr/lib64/nvidia"):
+    if os.path.exists(os.path.join(_dir, "libnvidia-ml.so.1")):
+        _NVML_LIB_DIR = _dir
+        break
+if _NVML_LIB_DIR:
+    CDLL(os.path.join(_NVML_LIB_DIR, "libnvidia-ml.so.1"))  # preload the handle
+    os.environ["LD_LIBRARY_PATH"] = _NVML_LIB_DIR
 import pynvml
 os.environ.pop("LD_LIBRARY_PATH", None)  # clear before any Qt import
 
@@ -55,11 +64,16 @@ if _pc_limit_env:
     except ValueError:
         PC_LIMIT = None
 
-# --- CPU power via zenergy (whole-socket energy accumulator, microjoules) ---
-# Esocket0 accumulates µJ for the entire CPU socket. Diffing it between
-# samples gives CPU package watts (verified: raw/1e6/dt matches the
-# per-core Ecore sum). hwmon index is not stable, so resolve by name.
+# --- CPU power: zenergy hwmon (Esocket0) or RAPL powercap (energy_uj) ---
+# Both are monotonic energy accumulators in microjoules; diffing them
+# between samples gives socket watts. The zenergy hwmon ships with the
+# Bazzite kernel; stock Ubuntu loads intel_rapl_msr on AMD Zen too
+# (trcc's own udev setup auto-loads it and chmods 0444 on energy_uj,
+# root-only since CVE-2020-8694). Resolve by name — hwmon/powercap
+# indices are not stable.
 _ZE_INPUT = None
+_RAPL_INPUT = None
+_CPU_ENERGY_FILE = None
 _ZE_LAST = None  # (raw_value, time)
 
 
@@ -85,10 +99,40 @@ def _zenergy_socket_file():
     return None
 
 
+def _rapl_package_file():
+    """Find the top-level RAPL package energy_uj path (cached).
+
+    Sorted glob order puts intel-rapl:0/energy_uj (whole package)
+    before intel-rapl:0:0/energy_uj (a core subdomain), so [0] is the
+    package accumulator.
+    """
+    global _RAPL_INPUT
+    if _RAPL_INPUT:
+        return _RAPL_INPUT
+    try:
+        cands = sorted(Path("/sys/class/powercap").glob("intel-rapl:*/energy_uj"))
+    except OSError:
+        cands = []
+    if cands:
+        _RAPL_INPUT = str(cands[0])
+    return _RAPL_INPUT
+
+
+def _cpu_energy_file():
+    """Resolve the CPU energy counter once: zenergy first, RAPL fallback."""
+    global _CPU_ENERGY_FILE
+    if _CPU_ENERGY_FILE is None:
+        f = _zenergy_socket_file()
+        if not f or not Path(f).exists():
+            f = _rapl_package_file()
+        _CPU_ENERGY_FILE = f
+    return _CPU_ENERGY_FILE
+
+
 def cpu_power_w():
-    """CPU package power in watts from the zenergy Esocket0 diff."""
+    """CPU package power in watts from the zenergy/RAPL energy diff."""
     global _ZE_LAST
-    p = _zenergy_socket_file()
+    p = _cpu_energy_file()
     if not p:
         return None
     try:
@@ -142,7 +186,10 @@ def c(v):
 def font(sz):
     for p in ["/usr/local/share/fonts/fira-code/FiraCode-Medium.ttf",
               "/usr/share/fonts/fira-code/FiraCode-Medium.ttf",
-              "/usr/share/fonts/TTF/FiraCode-Medium.ttf"]:
+              "/usr/share/fonts/TTF/FiraCode-Medium.ttf",
+              # Debian/Ubuntu fonts-firacode package installs OTF here
+              "/usr/share/fonts/opentype/firacode/FiraCode-Medium.otf",
+              "/usr/share/fonts/opentype/firacode/FiraCode-Medium.ttf"]:
         try:
             return ImageFont.truetype(p, sz)
         except:
