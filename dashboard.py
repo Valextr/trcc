@@ -291,6 +291,24 @@ def gpu_data():
         print(f"GPU error: {e}", file=sys.stderr)
         return None
 
+# Header time: resolve TZ explicitly instead of trusting the C
+# library's local time. Minimal container images ship without tzdata
+# (no /usr/share/zoneinfo); glibc then silently falls back to UTC for
+# a real TZ name AND caches that failure for the life of the process
+# (a later tzdata install never heals a running dashboard). Python's
+# zoneinfo reads the same TZ env var launch-dashboard.sh passes in,
+# and falls back to the pure-data `tzdata` PyPI package (lives in the
+# venv, so it survives container recreation) when system zone files
+# are missing. Bare datetime.now() only as the last resort.
+try:
+    from zoneinfo import ZoneInfo
+
+    _tz_name = os.environ.get("TZ")
+    HEADER_TZ = ZoneInfo(_tz_name) if _tz_name else None
+except Exception:
+    HEADER_TZ = None
+
+
 def render(gpu):
     img = Image.new("RGB", (W, H), BG)
     d = ImageDraw.Draw(img)
@@ -306,7 +324,7 @@ def render(gpu):
     y = 12  # top border padding
 
     # Header — date/time + uptime
-    now = datetime.now()
+    now = datetime.now(HEADER_TZ) if HEADER_TZ else datetime.now()
     ts = now.strftime("%Y-%m-%d  %H:%M:%S")
     T2 = font(21)
     d.text((M, y), ts, fill=CYAN, font=T2)

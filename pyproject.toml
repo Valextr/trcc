@@ -9,4 +9,8 @@ dependencies = [
     "pillow>=12.3.0",
     "pynvml>=13.0.1",
     "trcc-linux>=9.9.1",
+    # Pure-data IANA timezone DB: lets zoneinfo resolve TZ inside
+    # containers whose base image lacks /usr/share/zoneinfo (see
+    # HEADER_TZ in dashboard.py).
+    "tzdata>=2024.1",
 ]
